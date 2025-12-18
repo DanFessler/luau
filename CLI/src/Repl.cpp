@@ -43,6 +43,7 @@
 #include <signal.h>
 
 LUAU_FASTFLAG(DebugLuauTimeTracing)
+LUAU_FASTFLAG(LuauJsx)
 
 
 constexpr int MaxTraversalLimit = 50;
@@ -97,6 +98,16 @@ static Luau::CompileOptions copts()
     return result;
 }
 
+static Luau::ParseOptions popts(std::string_view chunkname)
+{
+    Luau::ParseOptions result;
+
+    if (FFlag::LuauJsx && chunkname.size() >= 5 && chunkname.substr(chunkname.size() - 5) == ".luax")
+        result.allowJsx = true;
+
+    return result;
+}
+
 static int lua_loadstring(lua_State* L)
 {
     size_t l = 0;
@@ -105,7 +116,7 @@ static int lua_loadstring(lua_State* L)
 
     lua_setsafeenv(L, LUA_ENVIRONINDEX, false);
 
-    std::string bytecode = Luau::compile(std::string(s, l), copts());
+    std::string bytecode = Luau::compile(std::string(s, l), copts(), popts(chunkname));
     if (luau_load(L, chunkname, bytecode.data(), bytecode.size(), 0) == 0)
         return 1;
 
@@ -583,7 +594,7 @@ static bool runFile(const char* name, lua_State* GL, bool repl)
 
     std::string chunkname = "@" + normalizePath(name);
 
-    std::string bytecode = Luau::compile(*source, copts());
+    std::string bytecode = Luau::compile(*source, copts(), popts(chunkname));
     int status = 0;
 
     if (luau_load(L, chunkname.c_str(), bytecode.data(), bytecode.size(), 0) == 0)

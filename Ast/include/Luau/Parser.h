@@ -311,6 +311,10 @@ private:
     // simpleexp -> NUMBER | STRING | NIL | true | false | ... | constructor | [attributes] FUNCTION body | primaryexp
     AstExpr* parseSimpleExpr();
 
+    // JSX element parsing (experimental; desugars into ordinary AST nodes)
+    AstExpr* parseJsxElement();
+    AstExpr* parseJsxChild();
+
     std::tuple<AstArray<AstExpr*>, Location, Location> parseCallList(TempVector<Position>* commaPositions);
     // args ::=  `(' [explist] `)' | tableconstructor | String
     AstExpr* parseFunctionArgs(AstExpr* func, bool self);
@@ -501,6 +505,7 @@ private:
     AstName nameNumber;
     AstName nameError;
     AstName nameNil;
+    AstName nameJsx;
 
     MatchLexeme endMismatchSuspect;
 

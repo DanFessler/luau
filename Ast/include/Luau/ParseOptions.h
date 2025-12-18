@@ -27,6 +27,8 @@ struct FragmentParseResumeSettings
 struct ParseOptions
 {
     bool allowDeclarationSyntax = false;
+    // Experimental syntax extensions that must be explicitly enabled by the host (and typically also gated by fastflags).
+    bool allowJsx = false;
     bool captureComments = false;
     std::optional<FragmentParseResumeSettings> parseFragment = std::nullopt;
     bool storeCstData = false;

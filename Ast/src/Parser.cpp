@@ -23,6 +23,7 @@ LUAU_FASTFLAGVARIABLE(DebugLuauStringSingletonBasedOnQuotes)
 LUAU_FASTFLAGVARIABLE(LuauExplicitTypeExpressionInstantiation)
 LUAU_FASTFLAG(LuauStandaloneParseType)
 LUAU_FASTFLAGVARIABLE(LuauCstStatDoWithStatsStart)
+LUAU_FASTFLAGVARIABLE(LuauJsx)
 
 // Clip with DebugLuauReportReturnTypeVariadicWithTypeSuffix
 bool luau_telemetry_parsed_return_type_variadic_with_type_suffix = false;
@@ -316,6 +317,7 @@ Parser::Parser(const char* buffer, size_t bufferSize, AstNameTable& names, Alloc
     nameNumber = names.getOrAdd("number");
     nameError = names.getOrAdd(kParseNameError);
     nameNil = names.getOrAdd("nil"); // nil is a reserved keyword
+    nameJsx = names.getOrAdd("jsx");
 
     matchRecoveryStopOnToken.assign(Lexeme::Type::Reserved_END, 0);
     matchRecoveryStopOnToken[Lexeme::Type::Eof] = 1;
@@ -3325,10 +3327,257 @@ AstExpr* Parser::parseSimpleExpr()
     {
         return parseIfElseExpr();
     }
+    else if (FFlag::LuauJsx && options.allowJsx && lexer.current().type == '<')
+    {
+        return parseJsxElement();
+    }
     else
     {
         return parsePrimaryExpr(/* asStatement= */ false);
     }
+}
+
+static bool isLowercaseFirstChar(const char* s)
+{
+    return s && s[0] >= 'a' && s[0] <= 'z';
+}
+
+AstExpr* Parser::parseJsxChild()
+{
+    if (lexer.current().type == '<')
+        return parseJsxElement();
+
+    if (lexer.current().type == '{')
+    {
+        MatchLexeme matchBrace = lexer.current();
+        nextLexeme();
+
+        AstExpr* expr = parseExpr();
+        expectMatchAndConsume('}', matchBrace, /* searchForMissing= */ true);
+        return expr;
+    }
+
+    // No raw JSX text support in this initial implementation.
+    // Make forward progress to avoid infinite loops in `<Foo>hello</Foo>`-style inputs.
+    Location loc = lexer.current().location;
+    nextLexeme();
+    return reportExprError(loc, {}, "JSX children must be an embedded expression ('{ ... }') or a nested JSX element");
+}
+
+AstExpr* Parser::parseJsxElement()
+{
+    // Grammar (initial, intentionally small):
+    // jsxElement ::= '<' jsxTagName {jsxAttribute} ('/>' | '>' {jsxChild} '</' jsxTagName '>')
+    // jsxTagName ::= Name {'.' Name}
+    // jsxAttribute ::= Name ['=' (String | '{' expr '}')]
+    // jsxChild ::= '<' ... | '{' expr '}'
+    //
+    // Desugaring:
+    //   <Foo bar={x} />           => jsx(Foo, {bar = x})
+    //   <frame />                 => jsx("frame", nil)
+    //   <Foo><Bar /></Foo>        => jsx(Foo, nil, jsx(Bar, nil))
+
+    Location elementStart = lexer.current().location;
+    expectAndConsume('<', "JSX element");
+
+    if (lexer.current().type == '>')
+        return reportExprError(Location(elementStart, lexer.current().location), {}, "JSX fragments ('<>...</>') are not supported yet");
+
+    // Parse tag name parts (Name {'.' Name})
+    std::vector<Name> tagParts;
+    tagParts.reserve(4);
+
+    if (lexer.current().type != Lexeme::Name)
+        return reportExprError(lexer.current().location, {}, "Expected a JSX tag name after '<'");
+
+    // First part
+    Name first = parseName("JSX tag name");
+    tagParts.push_back(first);
+
+    // Additional parts
+    while (lexer.current().type == '.')
+    {
+        nextLexeme();
+        if (lexer.current().type != Lexeme::Name)
+            return reportExprError(lexer.current().location, {}, "Expected an identifier after '.' in JSX tag name");
+        Name part = parseName("JSX tag name");
+        tagParts.push_back(part);
+    }
+
+    // Build tag expression: lowercase first part => "string", otherwise a dotted global/local path expression
+    AstExpr* tagExpr = nullptr;
+    if (tagParts.size() == 1 && isLowercaseFirstChar(tagParts.front().name.value))
+    {
+        scratchData.assign(tagParts.front().name.value);
+        AstArray<char> str = copy(scratchData);
+        tagExpr = allocator.alloc<AstExprConstantString>(first.location, str, AstExprConstantString::QuotedSimple);
+    }
+    else
+    {
+        // Build a dotted global/local path expression from the parsed parts.
+        AstLocal* const* value = localMap.find(tagParts.front().name);
+        if (value && *value)
+            tagExpr = allocator.alloc<AstExprLocal>(first.location, *value, (*value)->functionDepth != functionStack.size() - 1);
+        else
+            tagExpr = allocator.alloc<AstExprGlobal>(first.location, tagParts.front().name);
+
+        for (size_t i = 1; i < tagParts.size(); ++i)
+        {
+            // We don't have precise '.' token positions; use the start of the identifier as a reasonable approximation.
+            Position opPos = tagParts[i].location.begin;
+            Location fullLoc(first.location.begin, tagParts[i].location.end);
+            tagExpr = allocator.alloc<AstExprIndexName>(fullLoc, tagExpr, tagParts[i].name, tagParts[i].location, opPos, '.');
+        }
+    }
+
+    // Parse attributes until tag end ('>' or '/>')
+    TempVector<AstExprTable::Item> propsItems(scratchItem);
+    Location propsStart = lexer.current().location;
+
+    auto makeUnquotedKey = [&](AstName keyName, const Location& keyLoc) -> AstExpr*
+    {
+        scratchData.assign(keyName.value);
+        AstArray<char> str = copy(scratchData);
+        return allocator.alloc<AstExprConstantString>(keyLoc, str, AstExprConstantString::Unquoted);
+    };
+
+    while (lexer.current().type == Lexeme::Name)
+    {
+        Name attrName = parseName("JSX attribute name");
+
+        AstExpr* attrValue = nullptr;
+
+        if (lexer.current().type == '=')
+        {
+            nextLexeme();
+
+            if (lexer.current().type == '{')
+            {
+                MatchLexeme matchBrace = lexer.current();
+                nextLexeme();
+
+                attrValue = parseExpr();
+                expectMatchAndConsume('}', matchBrace, /* searchForMissing= */ true);
+            }
+            else if (lexer.current().type == Lexeme::QuotedString || lexer.current().type == Lexeme::RawString || lexer.current().type == Lexeme::InterpStringSimple)
+            {
+                attrValue = parseString();
+            }
+            else
+            {
+                attrValue = reportExprError(lexer.current().location, {}, "Expected a string literal or '{...}' after '=' in JSX attribute");
+            }
+        }
+        else
+        {
+            // Boolean shorthand: <Foo disabled />
+            attrValue = allocator.alloc<AstExprConstantBool>(attrName.location, true);
+        }
+
+        AstExprTable::Item item;
+        item.kind = AstExprTable::Item::Record;
+        item.key = makeUnquotedKey(attrName.name, attrName.location);
+        item.value = attrValue;
+        propsItems.push_back(item);
+    }
+
+    AstExpr* propsExpr = nullptr;
+    if (!propsItems.empty())
+    {
+        Location propsLoc(propsStart, lexer.current().location);
+        propsExpr = allocator.alloc<AstExprTable>(propsLoc, copy(propsItems));
+    }
+    else
+    {
+        propsExpr = allocator.alloc<AstExprConstantNil>(elementStart);
+    }
+
+    // Self-closing?
+    if (lexer.current().type == '/')
+    {
+        if (lexer.lookahead().type != '>')
+            return reportExprError(lexer.current().location, {}, "Expected '>' after '/' in JSX self-closing tag");
+
+        nextLexeme(); // '/'
+        expectAndConsume('>', "JSX element");
+
+        // jsx(tag, props)
+        TempVector<AstExpr*> callArgs(scratchExpr);
+        callArgs.push_back(tagExpr);
+        callArgs.push_back(propsExpr);
+
+        AstExpr* jsxFunc = allocator.alloc<AstExprGlobal>(elementStart, nameJsx);
+        Location elementLoc(elementStart.begin, lexer.previousLocation().end);
+        return allocator.alloc<AstExprCall>(elementLoc, jsxFunc, copy(callArgs), false, AstArray<AstTypeOrPack>{}, elementLoc);
+    }
+
+    // Normal open tag
+    expectAndConsume('>', "JSX element");
+
+    // Children
+    TempVector<AstExpr*> children(scratchExprAux);
+    while (!(lexer.current().type == '<' && lexer.lookahead().type == '/'))
+    {
+        if (lexer.current().type == Lexeme::Eof)
+            return reportExprError(Location(elementStart, lexer.current().location), {}, "Unterminated JSX element; expected closing tag");
+
+        children.push_back(parseJsxChild());
+    }
+
+    // Closing tag: </ name >
+    expectAndConsume('<', "JSX closing tag");
+    expectAndConsume('/', "JSX closing tag");
+
+    if (lexer.current().type != Lexeme::Name)
+        return reportExprError(lexer.current().location, {}, "Expected a JSX closing tag name");
+
+    TempVector<AstName> closeTagParts(scratchPackName);
+    Name closeFirst = parseName("JSX closing tag name");
+    closeTagParts.push_back(closeFirst.name);
+    while (lexer.current().type == '.')
+    {
+        nextLexeme();
+        if (lexer.current().type != Lexeme::Name)
+            return reportExprError(lexer.current().location, {}, "Expected an identifier after '.' in JSX closing tag name");
+        Name part = parseName("JSX closing tag name");
+        closeTagParts.push_back(part.name);
+    }
+
+    // Basic mismatch check (by parts)
+    bool mismatch = closeTagParts.size() != tagParts.size();
+    if (!mismatch)
+    {
+        for (size_t i = 0; i < tagParts.size(); ++i)
+            mismatch = mismatch || (closeTagParts[i] != tagParts[i].name);
+    }
+    if (mismatch)
+    {
+        scratchData.clear();
+        for (size_t i = 0; i < tagParts.size(); ++i)
+        {
+            if (i)
+                scratchData.push_back('.');
+            scratchData.append(tagParts[i].name.value ? tagParts[i].name.value : "<unknown>");
+        }
+        report(
+            closeFirst.location,
+            "Mismatched JSX closing tag; expected '</%s>'",
+            scratchData.c_str()
+        );
+    }
+
+    expectAndConsume('>', "JSX closing tag");
+
+    // jsx(tag, props, ...children)
+    TempVector<AstExpr*> callArgs(scratchExpr);
+    callArgs.push_back(tagExpr);
+    callArgs.push_back(propsExpr);
+    for (AstExpr* child : children)
+        callArgs.push_back(child);
+
+    AstExpr* jsxFunc = allocator.alloc<AstExprGlobal>(elementStart, nameJsx);
+    Location elementLoc(elementStart.begin, lexer.previousLocation().end);
+    return allocator.alloc<AstExprCall>(elementLoc, jsxFunc, copy(callArgs), false, AstArray<AstTypeOrPack>{}, elementLoc);
 }
 
 std::tuple<AstArray<AstExpr*>, Location, Location> Parser::parseCallList(TempVector<Position>* commaPositions)

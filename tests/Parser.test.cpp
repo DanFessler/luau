@@ -20,6 +20,7 @@ LUAU_FASTFLAG(LuauSolverV2)
 LUAU_DYNAMIC_FASTFLAG(DebugLuauReportReturnTypeVariadicWithTypeSuffix)
 LUAU_FASTFLAG(LuauExplicitTypeExpressionInstantiation)
 LUAU_FASTFLAG(LuauCstStatDoWithStatsStart)
+LUAU_FASTFLAG(LuauJsx)
 
 // Clip with DebugLuauReportReturnTypeVariadicWithTypeSuffix
 extern bool luau_telemetry_parsed_return_type_variadic_with_type_suffix;
@@ -133,6 +134,330 @@ TEST_CASE_FIXTURE(Fixture, "basic_parse")
 {
     AstStat* stat = parse("print(\"Hello World!\")");
     REQUIRE(stat != nullptr);
+}
+
+TEST_CASE_FIXTURE(Fixture, "jsx_self_closing_desugars_to_jsx_call")
+{
+    ScopedFastFlag sff_LuauJsx{FFlag::LuauJsx, true};
+
+    ParseOptions options;
+    options.allowJsx = true;
+
+    AstStatBlock* block = parse("return <Foo bar={x} />", options);
+    REQUIRE(block != nullptr);
+    REQUIRE(block->body.size == 1);
+
+    AstStatReturn* ret = block->body.data[0]->as<AstStatReturn>();
+    REQUIRE(ret != nullptr);
+    REQUIRE(ret->list.size == 1);
+
+    AstExprCall* call = ret->list.data[0]->as<AstExprCall>();
+    REQUIRE(call != nullptr);
+
+    AstExprGlobal* func = call->func->as<AstExprGlobal>();
+    REQUIRE(func != nullptr);
+    CHECK(func->name == "jsx");
+
+    REQUIRE(call->args.size == 2);
+    AstExprGlobal* tag = call->args.data[0]->as<AstExprGlobal>();
+    REQUIRE(tag != nullptr);
+    CHECK(tag->name == "Foo");
+
+    AstExprTable* props = call->args.data[1]->as<AstExprTable>();
+    REQUIRE(props != nullptr);
+    REQUIRE(props->items.size == 1);
+    CHECK(props->items.data[0].kind == AstExprTable::Item::Record);
+}
+
+TEST_CASE_FIXTURE(Fixture, "jsx_nested_child_desugars_to_nested_jsx_call")
+{
+    ScopedFastFlag sff_LuauJsx{FFlag::LuauJsx, true};
+
+    ParseOptions options;
+    options.allowJsx = true;
+
+    AstStatBlock* block = parse("return <Foo><Bar /></Foo>", options);
+    REQUIRE(block != nullptr);
+    REQUIRE(block->body.size == 1);
+
+    AstStatReturn* ret = block->body.data[0]->as<AstStatReturn>();
+    REQUIRE(ret != nullptr);
+    REQUIRE(ret->list.size == 1);
+
+    AstExprCall* call = ret->list.data[0]->as<AstExprCall>();
+    REQUIRE(call != nullptr);
+    REQUIRE(call->args.size == 3); // tag, props, child
+
+    AstExprCall* child = call->args.data[2]->as<AstExprCall>();
+    REQUIRE(child != nullptr);
+    AstExprGlobal* childFunc = child->func->as<AstExprGlobal>();
+    REQUIRE(childFunc != nullptr);
+    CHECK(childFunc->name == "jsx");
+}
+
+TEST_CASE_FIXTURE(Fixture, "jsx_mismatched_closing_tag_reports_error")
+{
+    ScopedFastFlag sff_LuauJsx{FFlag::LuauJsx, true};
+
+    ParseOptions options;
+    options.allowJsx = true;
+    options.allowDeclarationSyntax = true;
+
+    ParseResult result = tryParse("return <Foo></Bar>", options);
+    CHECK(!result.errors.empty());
+    CHECK_EQ(result.errors.front().getMessage(), "Mismatched JSX closing tag; expected '</Foo>'");
+}
+
+TEST_CASE_FIXTURE(Fixture, "jsx_attribute_expression_can_contain_table_literal")
+{
+    ScopedFastFlag sff_LuauJsx{FFlag::LuauJsx, true};
+
+    ParseOptions options;
+    options.allowJsx = true;
+
+    AstStatBlock* block = parse("return <Foo bar={{a=1}} />", options);
+    REQUIRE(block != nullptr);
+
+    AstStatReturn* ret = block->body.data[0]->as<AstStatReturn>();
+    REQUIRE(ret != nullptr);
+    REQUIRE(ret->list.size == 1);
+
+    AstExprCall* call = ret->list.data[0]->as<AstExprCall>();
+    REQUIRE(call != nullptr);
+    REQUIRE(call->args.size == 2);
+
+    AstExprTable* props = call->args.data[1]->as<AstExprTable>();
+    REQUIRE(props != nullptr);
+
+    std::optional<AstExpr*> bar = props->getRecord("bar");
+    REQUIRE(bar);
+
+    // The JSX brace wraps an expression; here the expression is a table constructor: {a=1}
+    AstExprTable* t = (*bar)->as<AstExprTable>();
+    REQUIRE(t != nullptr);
+    REQUIRE(t->items.size == 1);
+    CHECK(t->items.data[0].kind == AstExprTable::Item::Record);
+}
+
+TEST_CASE_FIXTURE(Fixture, "jsx_attribute_expression_can_contain_division")
+{
+    ScopedFastFlag sff_LuauJsx{FFlag::LuauJsx, true};
+
+    ParseOptions options;
+    options.allowJsx = true;
+
+    AstStatBlock* block = parse("return <Foo bar={10/2} />", options);
+    REQUIRE(block != nullptr);
+
+    AstStatReturn* ret = block->body.data[0]->as<AstStatReturn>();
+    REQUIRE(ret != nullptr);
+    REQUIRE(ret->list.size == 1);
+
+    AstExprCall* call = ret->list.data[0]->as<AstExprCall>();
+    REQUIRE(call != nullptr);
+    REQUIRE(call->args.size == 2);
+
+    AstExprTable* props = call->args.data[1]->as<AstExprTable>();
+    REQUIRE(props != nullptr);
+
+    std::optional<AstExpr*> bar = props->getRecord("bar");
+    REQUIRE(bar);
+
+    AstExprBinary* bin = (*bar)->as<AstExprBinary>();
+    REQUIRE(bin != nullptr);
+    CHECK(bin->op == AstExprBinary::Div);
+}
+
+TEST_CASE_FIXTURE(Fixture, "jsx_child_expression_can_be_table_literal")
+{
+    ScopedFastFlag sff_LuauJsx{FFlag::LuauJsx, true};
+
+    ParseOptions options;
+    options.allowJsx = true;
+
+    AstStatBlock* block = parse("return <Foo>{ {a=1} }</Foo>", options);
+    REQUIRE(block != nullptr);
+
+    AstStatReturn* ret = block->body.data[0]->as<AstStatReturn>();
+    REQUIRE(ret != nullptr);
+    REQUIRE(ret->list.size == 1);
+
+    AstExprCall* call = ret->list.data[0]->as<AstExprCall>();
+    REQUIRE(call != nullptr);
+    REQUIRE(call->args.size == 3); // tag, props, child
+
+    AstExprTable* child = call->args.data[2]->as<AstExprTable>();
+    REQUIRE(child != nullptr);
+}
+
+TEST_CASE_FIXTURE(Fixture, "luax_less_than_expression_is_not_jsx")
+{
+    ScopedFastFlag sff_LuauJsx{FFlag::LuauJsx, true};
+
+    ParseOptions options;
+    options.allowJsx = true;
+
+    AstStatBlock* block = parse("return 1 < 2", options);
+    REQUIRE(block != nullptr);
+
+    AstStatReturn* ret = block->body.data[0]->as<AstStatReturn>();
+    REQUIRE(ret != nullptr);
+    REQUIRE(ret->list.size == 1);
+
+    AstExprBinary* bin = ret->list.data[0]->as<AstExprBinary>();
+    REQUIRE(bin != nullptr);
+    CHECK(bin->op == AstExprBinary::CompareLt);
+}
+
+TEST_CASE_FIXTURE(Fixture, "jsx_boolean_attribute_shorthand_is_true")
+{
+    ScopedFastFlag sff_LuauJsx{FFlag::LuauJsx, true};
+
+    ParseOptions options;
+    options.allowJsx = true;
+
+    AstStatBlock* block = parse("return <Foo disabled />", options);
+    REQUIRE(block != nullptr);
+
+    AstStatReturn* ret = block->body.data[0]->as<AstStatReturn>();
+    REQUIRE(ret != nullptr);
+    REQUIRE(ret->list.size == 1);
+
+    AstExprCall* call = ret->list.data[0]->as<AstExprCall>();
+    REQUIRE(call != nullptr);
+    REQUIRE(call->args.size == 2);
+
+    AstExprTable* props = call->args.data[1]->as<AstExprTable>();
+    REQUIRE(props != nullptr);
+
+    std::optional<AstExpr*> disabled = props->getRecord("disabled");
+    REQUIRE(disabled);
+
+    AstExprConstantBool* b = (*disabled)->as<AstExprConstantBool>();
+    REQUIRE(b != nullptr);
+    CHECK(b->value == true);
+}
+
+TEST_CASE_FIXTURE(Fixture, "jsx_string_attribute_literal_parses")
+{
+    ScopedFastFlag sff_LuauJsx{FFlag::LuauJsx, true};
+
+    ParseOptions options;
+    options.allowJsx = true;
+
+    AstStatBlock* block = parse("return <Foo title=\"hi\" />", options);
+    REQUIRE(block != nullptr);
+
+    AstStatReturn* ret = block->body.data[0]->as<AstStatReturn>();
+    REQUIRE(ret != nullptr);
+    REQUIRE(ret->list.size == 1);
+
+    AstExprCall* call = ret->list.data[0]->as<AstExprCall>();
+    REQUIRE(call != nullptr);
+    REQUIRE(call->args.size == 2);
+
+    AstExprTable* props = call->args.data[1]->as<AstExprTable>();
+    REQUIRE(props != nullptr);
+
+    std::optional<AstExpr*> title = props->getRecord("title");
+    REQUIRE(title);
+
+    AstExprConstantString* s = (*title)->as<AstExprConstantString>();
+    REQUIRE(s != nullptr);
+    CHECK(std::string_view{s->value.data, s->value.size} == "hi");
+}
+
+TEST_CASE_FIXTURE(Fixture, "jsx_child_expression_can_contain_operators_like_lt_and_div")
+{
+    ScopedFastFlag sff_LuauJsx{FFlag::LuauJsx, true};
+
+    ParseOptions options;
+    options.allowJsx = true;
+
+    AstStatBlock* block = parse("return <Foo>{a < b and 10/2}</Foo>", options);
+    REQUIRE(block != nullptr);
+
+    AstStatReturn* ret = block->body.data[0]->as<AstStatReturn>();
+    REQUIRE(ret != nullptr);
+    REQUIRE(ret->list.size == 1);
+
+    AstExprCall* call = ret->list.data[0]->as<AstExprCall>();
+    REQUIRE(call != nullptr);
+    REQUIRE(call->args.size == 3); // tag, props, child
+
+    AstExprBinary* andExpr = call->args.data[2]->as<AstExprBinary>();
+    REQUIRE(andExpr != nullptr);
+    CHECK(andExpr->op == AstExprBinary::And);
+
+    AstExprBinary* ltExpr = andExpr->left->as<AstExprBinary>();
+    REQUIRE(ltExpr != nullptr);
+    CHECK(ltExpr->op == AstExprBinary::CompareLt);
+
+    AstExprBinary* divExpr = andExpr->right->as<AstExprBinary>();
+    REQUIRE(divExpr != nullptr);
+    CHECK(divExpr->op == AstExprBinary::Div);
+}
+
+TEST_CASE_FIXTURE(Fixture, "jsx_raw_text_children_are_rejected")
+{
+    ScopedFastFlag sff_LuauJsx{FFlag::LuauJsx, true};
+
+    ParseOptions options;
+    options.allowJsx = true;
+    options.allowDeclarationSyntax = true;
+
+    ParseResult result = tryParse("return <Foo>hello</Foo>", options);
+    CHECK(!result.errors.empty());
+    CHECK_EQ(
+        result.errors.front().getMessage(),
+        "JSX children must be an embedded expression ('{ ... }') or a nested JSX element"
+    );
+}
+
+TEST_CASE_FIXTURE(Fixture, "jsx_mismatched_closing_tag_includes_dotted_name")
+{
+    ScopedFastFlag sff_LuauJsx{FFlag::LuauJsx, true};
+
+    ParseOptions options;
+    options.allowJsx = true;
+    options.allowDeclarationSyntax = true;
+
+    ParseResult result = tryParse("return <Foo.Bar></Foo.Baz>", options);
+    CHECK(!result.errors.empty());
+    CHECK_EQ(result.errors.front().getMessage(), "Mismatched JSX closing tag; expected '</Foo.Bar>'");
+}
+
+TEST_CASE_FIXTURE(Fixture, "luax_explicit_type_instantiation_still_parses")
+{
+    ScopedFastFlag sff_LuauJsx{FFlag::LuauJsx, true};
+    ScopedFastFlag sff_LuauExplicitTypeExpressionInstantiation{FFlag::LuauExplicitTypeExpressionInstantiation, true};
+
+    ParseOptions options;
+    options.allowJsx = true;
+
+    AstStatBlock* block = parse("return f<<number>>()", options);
+    REQUIRE(block != nullptr);
+
+    AstStatReturn* ret = block->body.data[0]->as<AstStatReturn>();
+    REQUIRE(ret != nullptr);
+    REQUIRE(ret->list.size == 1);
+
+    AstExprCall* call = ret->list.data[0]->as<AstExprCall>();
+    REQUIRE(call != nullptr);
+
+    AstExprInstantiate* inst = call->func->as<AstExprInstantiate>();
+    REQUIRE(inst != nullptr);
+}
+
+TEST_CASE_FIXTURE(Fixture, "jsx_multiline_open_tag_parses")
+{
+    ScopedFastFlag sff_LuauJsx{FFlag::LuauJsx, true};
+
+    ParseOptions options;
+    options.allowJsx = true;
+
+    AstStatBlock* block = parse("return <Foo\nbar={1}\n/>", options);
+    REQUIRE(block != nullptr);
 }
 
 TEST_CASE_FIXTURE(Fixture, "can_haz_annotations")

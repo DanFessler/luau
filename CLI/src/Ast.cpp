@@ -10,6 +10,8 @@
 
 #include "Luau/FileUtils.h"
 
+LUAU_FASTFLAG(LuauJsx)
+
 static void displayHelp(const char* argv0)
 {
     printf("Usage: %s [file]\n", argv0);
@@ -65,6 +67,8 @@ int main(int argc, char** argv)
     Luau::ParseOptions options;
     options.captureComments = true;
     options.allowDeclarationSyntax = true;
+    if (FFlag::LuauJsx && std::string_view(name).size() >= 5 && std::string_view(name).substr(std::string_view(name).size() - 5) == ".luax")
+        options.allowJsx = true;
 
     Luau::ParseResult parseResult = Luau::Parser::parse(source.data(), source.size(), names, allocator, std::move(options));
 

@@ -44,6 +44,7 @@ LUAU_FASTFLAGVARIABLE(LuauUseWorkspacePropToChooseSolver)
 LUAU_FASTFLAGVARIABLE(LuauPassTypeCheckLimitsEarly)
 LUAU_FASTFLAGVARIABLE(DebugLuauAlwaysShowConstraintSolvingIncomplete)
 LUAU_FASTFLAG(LuauStandaloneParseType)
+LUAU_FASTFLAG(LuauJsx)
 
 namespace Luau
 {
@@ -1831,6 +1832,11 @@ std::pair<SourceNode*, SourceModule*> Frontend::getSourceNode(const ModuleName& 
     const Config& config = configResolver->getConfig(name, limits);
     ParseOptions opts = config.parseOptions;
     opts.captureComments = true;
+
+    // JSX parsing is opt-in; currently we enable it for .luax sources (and only when the feature flag is on).
+    if (FFlag::LuauJsx && name.size() >= 5 && name.compare(name.size() - 5, 5, ".luax") == 0)
+        opts.allowJsx = true;
+
     SourceModule result = parse(name, source->source, opts);
     result.type = source->type;
 

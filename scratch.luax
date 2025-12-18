@@ -1,0 +1,30 @@
+-- Minimal end-to-end JSX smoke test for the Luau parser spike.
+-- Run (after building luau): ./build/debug/luau --fflags=LuauJsx=true scratch.luax
+
+function jsx(tag, props, ...)
+    local children = { ... }
+
+    local tagRepr = tag
+    if type(tag) == "table" then
+        tagRepr = "[table]"
+    elseif type(tag) == "function" then
+        tagRepr = "[function]"
+    end
+
+    local bar = props and props.bar
+    print("jsx:", tagRepr, "bar=", bar, "children=", #children)
+
+    return {
+        tag = tag,
+        props = props,
+        children = children,
+    }
+end
+
+local Foo = "FooComponent"
+local x = 123
+
+local el = <Foo bar={x}><frame /></Foo>
+print("result.tag=", el.tag, "result.props.bar=", el.props.bar, "child.tag=", el.children[1].tag)
+
+
